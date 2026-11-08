@@ -2,4 +2,9 @@
 src = "src"
 test = "test"
 libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 1
+via_ir = true
 bytecode_hash = "none"
