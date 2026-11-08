@@ -19,7 +19,7 @@ Binding specification of one Ethereum mainnet company launch: contracts, the (p)
 
 ## 2. Contracts, deploy order
 
-All in one launch transaction under 16 777 216 gas; no linked libraries, delegatecall or calls after deploy; at most 8 contracts in the launch.
+All in one launch transaction under 16 777 216 gas; no linked libraries, delegatecall or calls after deploy; at most 8 contracts beside the token.
 
 1. PimdRegistry(asset admin 0x8Ad18E99F4C8d8406f9Ba8899CF308000518A981): the code of v1 PimdRegistry, changed only so: no IMD path check; no open pairs limit (Asset keeps its v1 struct for the fixed BoundaryProofVerifier, maxOpenPairs 0, never read); the asset admin replaces its immutable owner and may hand its role to a new address. (fail, don't change)
 2. BoundaryOracle($contract:PimdRegistry, BoundaryProofVerifier): the code of v1 BoundaryOracle, only its registry differs: same functions, events, INTAKE, signer, BOND 10 IMD, PROOF_WINDOW 27 h, DISPUTE_WINDOW 1 h, TIMEOUT 3 days, one oracle question per hop, fee oracleCost = INTAKE price per question times hops. (fail, don't change)
