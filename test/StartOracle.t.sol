@@ -147,6 +147,48 @@ contract StartOracleTest is BaseTest {
         startOracle.onOracleResult(id0, unsigned, "");
     }
 
+    /// @dev Finding dfb118e4: an open request the intake never answers can be replaced after REQUEST_TTL.
+    function test_staleRequestReplaceableAfterTtl() public {
+        imd.mint(bob, 100 ether);
+        vm.prank(bob);
+        imd.approve(address(startOracle), type(uint256).max);
+        vm.warp(T0 + 30 days);
+        vm.prank(alice);
+        startOracle.request(1, T0, FIRST);
+        bytes32 id0 = intake.ids(0);
+        vm.warp(T0 + 30 days + startOracle.REQUEST_TTL() - 1);
+        vm.prank(bob);
+        vm.expectRevert(StartOracle.InvalidState.selector);
+        startOracle.request(1, T0, FIRST + 1);
+        vm.warp(T0 + 30 days + startOracle.REQUEST_TTL());
+        vm.expectEmit(true, true, true, true);
+        emit StartOracle.StartExpired(1, T0, alice);
+        vm.prank(bob);
+        startOracle.request(1, T0, FIRST + 1);
+        StartOracle.Pending memory p = startOracle.pending(1, T0);
+        assertTrue(p.open);
+        assertEq(p.requester, bob);
+        assertEq(p.firstBlock, FIRST + 1);
+        assertEq(intake.pulled(), 2 ether);
+        // an answer to the stale request is refused; answers to the new one record the price
+        BoundaryOracle.Attestation memory old = _attestation(0, 1500e36, keccak256("b"), FIRST);
+        signer.accept(startOracle.digest(old));
+        vm.prank(INTAKE);
+        vm.expectRevert(StartOracle.InvalidState.selector);
+        startOracle.onOracleResult(id0, old, "");
+        bytes32 bh = keccak256("block");
+        BoundaryOracle.Attestation memory att0 = _attestation(0, 1500e36, bh, FIRST + 1);
+        BoundaryOracle.Attestation memory att1 = _attestation(1, 4000e24, bh, FIRST + 1);
+        signer.accept(startOracle.digest(att0));
+        signer.accept(startOracle.digest(att1));
+        vm.startPrank(INTAKE);
+        startOracle.onOracleResult(intake.ids(2), att0, "");
+        startOracle.onOracleResult(intake.ids(3), att1, "");
+        vm.stopPrank();
+        assertApproxEqAbs(startOracle.price(1, T0), uint256(1e18) * 4000 / 1500, 1e6);
+        assertFalse(startOracle.pending(1, T0).open);
+    }
+
     function test_failureFreesTheSlotForARepeat() public {
         vm.warp(T0 + 30 days);
         vm.prank(alice);

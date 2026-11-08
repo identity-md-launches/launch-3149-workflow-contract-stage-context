@@ -18,8 +18,10 @@ import {IOracleIntake} from "./interfaces/IOracleIntake.sol";
 /// they never settle a market.
 /// @dev The requester alone pays BoundaryOracle.oracleCost(version) in IMD, one question per hop, and
 /// the gas. A request the intake refuses reverts and records nothing; a request the oracle fails
-/// clears its slot, so it may be repeated. The answer must pass the same attestation checks as a
-/// BoundaryOracle dispute resolution, signed by the same signer, for this consumer.
+/// clears its slot, so it may be repeated; a request left unanswered for REQUEST_TTL (the validity the
+/// question body asks for) may be replaced by a new one, which voids the old questions. The answer
+/// must pass the same attestation checks as a BoundaryOracle dispute resolution, signed by the same
+/// signer, for this consumer.
 contract StartOracle is ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
 
@@ -33,6 +35,8 @@ contract StartOracle is ReentrancyGuard, EIP712 {
     bytes32 public constant TYPEHASH = keccak256(
         "OracleAttestation(bytes32 requestId,uint256 chainId,bytes32 questionHash,uint8 answerType,bytes answer,uint256 figure,uint64 fromBlock,uint64 toBlock,bytes32 blockHash,bytes32 panelJobId,uint16 panelSize,uint16 quorum,uint16 agreed,uint64 issuedAt,uint64 expiresAt)"
     );
+    /// @notice An open request this old (the question body's validForSeconds) may be replaced.
+    uint256 public constant REQUEST_TTL = 86400;
 
     PimdRegistry public immutable registry;
     BoundaryOracle public immutable oracle;
@@ -70,6 +74,7 @@ contract StartOracle is ReentrancyGuard, EIP712 {
     event OracleRequested(bytes32 indexed requestId, bytes32 indexed key, uint8 hop, bytes32 questionHash);
     event StartRecorded(uint32 indexed version, uint64 indexed boundary, uint256 price);
     event StartFailed(uint32 indexed version, uint64 indexed boundary, uint8 status);
+    event StartExpired(uint32 indexed version, uint64 indexed boundary, address indexed requester);
 
     constructor(PimdRegistry registry_, BoundaryOracle oracle_) EIP712("IdentityMD Oracle", "2") {
         if (address(registry_) == address(0) || address(oracle_) == address(0)) revert InvalidState();
@@ -87,15 +92,24 @@ contract StartOracle is ReentrancyGuard, EIP712 {
 
     /// @notice Asks the IMD oracle for the version's price at `boundary`, a registry boundary 27 h or
     /// more in the past. `firstBlock` is the first block at or after the boundary; the oracle refuses a
-    /// wrong one. The caller pays BoundaryOracle.oracleCost(version) in IMD.
+    /// wrong one. The caller pays BoundaryOracle.oracleCost(version) in IMD. An open request is refused
+    /// until it is REQUEST_TTL old; then a new request replaces it and its questions are void.
     function request(uint32 version, uint64 boundary, uint64 firstBlock) external nonReentrant {
         T.Asset memory a = registry.asset(version);
         bytes32 k = key(version, boundary);
+        Pending storage stale = pendings[k];
         if (
             block.chainid != 1 || !registry.isBoundary(boundary)
                 || block.timestamp < uint256(boundary) + oracle.PROOF_WINDOW() || price[version][boundary] != 0
-                || pendings[k].open || firstBlock == 0 || uint256(firstBlock) + 2 >= block.number
+                || (stale.open && block.timestamp < uint256(stale.requestedAt) + REQUEST_TTL) || firstBlock == 0
+                || uint256(firstBlock) + 2 >= block.number
         ) revert InvalidState();
+        if (stale.open) {
+            for (uint256 i; i < 3; ++i) {
+                requests[stale.requests[i]].pending = false;
+            }
+            emit StartExpired(version, boundary, stale.requester);
+        }
         (uint256 fee, uint256 total) = oracle.oracleCost(version);
         uint256 beforeBalance = IERC20(T.IMD).balanceOf(address(this));
         IERC20(T.IMD).safeTransferFrom(msg.sender, address(this), total);

@@ -66,11 +66,14 @@ times hops, 0.5 IMD per question when INTAKE quotes nothing), `finalize` after t
 ## StartOracle
 
 - `request(version, boundary, firstBlock)`: boundary a registry boundary 27 h or more in the past, no
-  price yet, no open request; the caller pays `BoundaryOracle.oracleCost(version)` in IMD and gas.
-  One INTAKE question per hop, the same questions BoundaryOracle asks, consumer = StartOracle.
+  price yet, no open request younger than `REQUEST_TTL` (86,400 s, the validity the question body asks
+  for); the caller pays `BoundaryOracle.oracleCost(version)` in IMD and gas. One INTAKE question per
+  hop, the same questions BoundaryOracle asks, consumer = StartOracle.
 - Answers go through the same attestation checks as BoundaryOracle (signer, question hash, block
   window, panel, validity). `price(version, boundary)` is USD per U tokens at 18 decimals.
 - A refused request reverts and records nothing; a failed one clears the slot so it can be repeated.
+  An open request the intake never answers can be replaced once it is `REQUEST_TTL` old: the new
+  request voids the old questions (`StartExpired`), and the old requester's fee is not refunded.
 - StartOracle prices are strikes only; they never settle a market.
 
 ## PimdSwap2
@@ -81,12 +84,16 @@ for exactly N USDC, `exactOutputAsset` pays USDC for exactly N asset tokens. The
 
 ## PimdAbove (USDC only)
 
-- Market = (asset version, registry period, end boundary after now, threshold X in USD per token at
-  18 decimals, the BoundaryOracle price scale). Admin only; one market per threshold and end.
+- Market = (asset version, registry period, end boundary after now, threshold X). Admin only; one
+  market per threshold and end. X is on BoundaryOracle's price scale: USD at 18 decimals per
+  `unitsPerShare` of the version's token. For version 1 (U = 1 IMD) that is USD per IMD; for a version
+  with U = 10,000 tokens, "above 0.0001 USD per token" is X = 1e18. The admin writes X in that unit.
 - Pair = 1 YES + 1 NO backed by exactly 1 USDC. `split`, `merge`. Shares have 6 decimals.
 - Close = the version's BoundaryOracle price at the end. YES wins if close > X, NO if close < X. Tie,
-  or no close 3 days after the end: every share redeems 0.5 USDC. `claim` settles, cancels the caller's
-  resting orders in the market and credits the payout to the free balance.
+  or no close 3 days after the end: every share redeems 0.5 USDC. Before voiding a market at end + 3
+  days, `settle` finalizes an unchallenged BoundaryOracle proposal whose dispute window has elapsed and
+  uses its close; only a boundary with no price and no finalizable proposal is voided. `claim` settles,
+  cancels the caller's resting orders in the market and credits the payout to the free balance.
 - Books: YES buy/sell and NO buy/sell, price 0.0001-0.9999, tick 0.0001. Buy N at p locks exactly N*p,
   fee inside: it spends at most the lock, gets (amount - fee)/p shares, stops at N. Sell N locks those
   N shares, gets N*p minus the fee. Market orders: size or USDC amount plus worst price, unfilled rest
@@ -97,10 +104,20 @@ for exactly N USDC, `exactOutputAsset` pays USDC for exactly N asset tokens. The
 - Fee = k*(1-q) of the amount, q = the fill price per share clamped 0.01..0.99; taker K = 0.05, maker
   Km = 0.01; credited to $owner; none on cancel, expiry, split, merge, claim.
 - Price then time priority, partial fills, up to 64 fills per transaction, 1024 per order. Min order
-  N*p >= 1 USDC; a rest under it is cancelled in that transaction with its lock refunded. An expired
-  order met during matching is closed and its lock returned to its owner. `matchMarket` by anyone; the
-  gap of a taker's fill goes to the transaction sender. Orders, fills, split and merge continue after
-  the end until settlement; from settlement only cancel, claim and withdraw.
+  N*p >= 1 USDC; a rest under it (remaining shares times price, or a buy's lock no longer paying for
+  one share) is cancelled in that transaction with its lock refunded to its owner. An expired order
+  met during matching is closed and its lock returned to its owner. `matchMarket` by anyone.
+- Gap rule, settled fill by fill: the transaction sender (the taker itself in `place`, else the
+  `matchMarket` caller) receives, for each fill its transaction makes, the taker's limit cost of the
+  shares bought (n*p) minus what they cost on a buy, taken out of the lock so the lock keeps covering
+  the remaining shares; on a sell, the net proceeds over n*p, the fee coming out of that surplus first
+  (the seller receives min(net proceeds, n*p)). A fill at the limit has no gap. The unspent lock of a
+  buy that closes (filled, at its fill cap, under the minimum, expired or cancelled) always returns to
+  its owner; `GapReturned` records every gap payment. An amount-based market buy has no per-fill gap:
+  its unspent amount returns to its owner in its own transaction.
+- Orders, fills, split and merge continue after the end until settlement; from settlement only cancel,
+  claim and withdraw. `ordersOf` lists a trader's resting orders only; a closed order leaves the list,
+  so `claim` cancels the live ones and its cost does not grow with the trader's history.
 - Worked example of SPEC.md section 5 is `test_specExampleVikaAndBob` in `test/PimdAbove.t.sol`.
 
 ## Operational responsibilities
@@ -113,6 +130,16 @@ for exactly N USDC, `exactOutputAsset` pays USDC for exactly N asset tokens. The
   `configureAsset` and `addPeriod` in the registry.
 - **Anyone:** `prove`/`propose`/`dispute`/`finalize` in BoundaryOracle so markets can settle;
   `StartOracle.request` for strikes 27 h or more after a start; `matchMarket` for crossed books.
+- **Proposers (operator or anyone):** prove within 27 h, else propose as early as possible after
+  27 h. A proposal made late in its window leaves a disputer who lodges a challenge in its last
+  seconds certain that no oracle answer can land before the boundary's timeout (v1 BoundaryOracle
+  rule), which voids every market on that boundary to Half. An early proposal leaves the panel about
+  44 h. `settle` finalizes an unchallenged proposal itself, so a late honest proposal is never lost.
+- **Makers:** resting orders keep filling after the end until someone calls `settle`, including once
+  the close is known on chain (SPEC.md section 5: "until settlement"). Cancel resting orders at the
+  end, or call `settle` yourself as soon as the close is recorded.
+- **StartOracle requesters:** an unanswered request may be replaced after `REQUEST_TTL`; the fee of
+  the replaced request is not refunded.
 
 ## Build and test
 
@@ -130,3 +157,11 @@ ABIs: `docs/abi/<Contract>.json`. Tests use mocks at the fixed mainnet addresses
 - Tests are not a security audit; the contracts hold user USDC and IMD bonds and need the independent
   adversarial review before launch.
 - Orderbook insertion is a linear walk; a very deep book at one price level costs the placer more gas.
+- `claim` cancels every resting order of the caller in the market in one transaction; a trader with
+  very many resting orders should `cancel` them first, then `claim`.
+- Rounding in a move fill: the buyer's base is rounded up and the seller's proceeds down, so when
+  n*price is not a whole USDC unit one unit (1e-6 USDC) stays in the contract unassigned; Half claims
+  floor an odd yes+no the same way. The contract only ever gains this dust (solvency holds) and has no
+  sweep for it. Mint and burn fills are exact.
+- A dispute lodged in the last seconds of a late proposal's window guarantees the boundary times out
+  (see Operational responsibilities); BoundaryOracle is the fixed v1 code and this is not changed here.

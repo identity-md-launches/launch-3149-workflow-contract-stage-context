@@ -251,6 +251,231 @@ contract PimdAboveTest is BaseTest {
         vm.stopPrank();
     }
 
+    /// @dev Taker buy cost of `n` shares at maker price `p` with the taker fee inside (K = 0.05).
+    function _takerCost(uint256 n, uint256 p) internal pure returns (uint256) {
+        uint256 base = n * p / 1e6;
+        uint256 rate = 500 * (1e6 - p);
+        uint256 fee = (base * rate + (1e10 - rate) - 1) / (1e10 - rate);
+        return base + fee;
+    }
+
+    /// @dev Finding 8904774a: a resting taker buy closed by a third party's matchMarket keeps its unspent
+    /// lock; the match caller earns only the gap of the fills its transaction made.
+    function test_restingTakerBuyGapPerFillAndLockStaysWithOwner() public {
+        address carol = makeAddr("carol");
+        vm.prank(alice);
+        above.split(mid, 130e6);
+        for (uint256 i; i < 65; ++i) {
+            _sell(alice, true, 2e6, 0.5e6);
+        }
+        // bob: limit buy 130 YES at 0.9, lock 117 USDC; 64 fills of 2 at 0.5 in his own transaction
+        uint64 bobId = _buy(bob, true, 130e6, 0.9e6);
+        uint256 cost = _takerCost(2e6, 0.5e6); // 1,025,642
+        uint256 gap = 1.8e6 - cost; // 774,358 per fill
+        PimdAbove.Order memory o = above.order(bobId);
+        assertTrue(o.resting);
+        assertEq(o.fills, 64);
+        assertEq(o.remaining, 2e6);
+        assertEq(o.lock, 1.8e6, "lock covers exactly the remaining shares at the limit");
+        assertEq(above.balance(bob), 1000e6 - 117e6 + 64 * gap, "own fills' gap back to the taker");
+        // carol matches the 65th fill: she earns that fill's gap only, bob's order closes with nothing left
+        uint256 bobBefore = above.balance(bob);
+        vm.prank(carol);
+        assertEq(above.matchMarket(mid), 1);
+        assertEq(above.balance(carol), gap, "match caller gets one fill's gap");
+        assertEq(above.balance(bob), bobBefore, "owner's balance untouched by the match");
+        o = above.order(bobId);
+        assertFalse(o.resting);
+        assertEq(o.lock, 0);
+        assertEq(o.fills, 65);
+        (uint256 by,) = above.positions(mid, bob);
+        assertEq(by, 130e6);
+        // conservation: deposits == balances + locks + pairs
+        uint256 total = above.balance(alice) + above.balance(bob) + above.balance(vika) + above.balance(carol)
+            + above.balance(OWNER) + above.market(mid).pairs;
+        assertEq(total, 3000e6);
+    }
+
+    /// @dev Finding 8904774a at the 1024-fill cap: the lock of shares never bought returns to the owner.
+    function test_fillCapReturnsUnfilledLockToOwner() public {
+        address carol = makeAddr("carol");
+        usdc.mint(alice, 3000e6);
+        usdc.mint(bob, 5000e6);
+        vm.prank(alice);
+        above.deposit(3000e6);
+        vm.prank(bob);
+        above.deposit(5000e6);
+        vm.prank(alice);
+        above.split(mid, 3075e6);
+        // 1025 asks of 3 YES at 0.6000 down to 0.4976, each inserted at the head
+        for (uint256 i; i < 1025; ++i) {
+            _sell(alice, true, 3e6, uint128(0.6e6 - i * 100));
+        }
+        // bob: limit buy 10,000 YES at 0.6 (lock 6000); his transaction fills the 64 cheapest asks
+        uint64 bobId = _buy(bob, true, 10_000e6, 0.6e6);
+        // per fill: limit cost 1.8 USDC; the gap is what the fill cost less than that (0 when the fee
+        // inside the limit pushes a fill near the limit over it: `over`, paid from the lock as always)
+        uint256 ownGap;
+        uint256 carolGap;
+        uint256 spent;
+        uint256 over;
+        for (uint256 i = 1024; i >= 1; --i) {
+            uint256 c = _takerCost(3e6, 0.6e6 - i * 100);
+            spent += c;
+            if (c < 1.8e6) {
+                if (i >= 961) ownGap += 1.8e6 - c;
+                else carolGap += 1.8e6 - c;
+            } else {
+                over += c - 1.8e6;
+            }
+        }
+        assertEq(above.balance(bob), ownGap, "bob's own fills' gap is his");
+        for (uint256 i; i < 15; ++i) {
+            vm.prank(carol);
+            above.matchMarket(mid);
+        }
+        PimdAbove.Order memory o = above.order(bobId);
+        assertEq(o.fills, 1024);
+        assertFalse(o.resting, "closed at the cap");
+        assertEq(above.balance(carol), carolGap, "the match caller gets the gap of her fills only");
+        uint256 unfilledLock = (10_000e6 - 3072e6) * 0.6e6 / 1e6; // 4156.8 USDC
+        assertEq(above.balance(bob), ownGap + unfilledLock - over, "the lock of unbought shares is back with bob");
+        assertEq(above.balance(bob) + above.balance(carol) + spent, 6000e6, "conservation of bob's lock");
+        (uint256 by,) = above.positions(mid, bob);
+        assertEq(by, 3072e6);
+    }
+
+    /// @dev Finding a5389dc1: a buy's rest under 1 USDC of notional closes in the same transaction.
+    function test_buyRestUnderMinClosesInTransaction() public {
+        vm.prank(alice);
+        above.split(mid, 2e6);
+        _sell(alice, true, 2e6, 0.5e6);
+        uint64 bobId = _buy(bob, true, 3e6, 0.9e6);
+        PimdAbove.Order memory o = above.order(bobId);
+        assertFalse(o.resting, "rest of 1 share at 0.9 is under the minimum");
+        assertEq(o.lock, 0);
+        assertEq(above.balance(bob), 1000e6 - _takerCost(2e6, 0.5e6), "bob paid the fill only");
+        (uint256 by,) = above.positions(mid, bob);
+        assertEq(by, 2e6);
+        assertEq(above.ordersOf(mid, bob).length, 0);
+    }
+
+    /// @dev Finding 8961590e: a resting taker sell's proceeds over its limit go to the match caller.
+    function test_restingTakerSellGapGoesToMatchCaller() public {
+        address carol = makeAddr("carol");
+        for (uint256 i; i < 65; ++i) {
+            _buy(alice, true, 2e6, 0.6e6);
+        }
+        vm.prank(bob);
+        above.split(mid, 130e6);
+        uint64 bobId = _sell(bob, true, 130e6, 0.5e6);
+        // each maker buy of 2 at 0.6 with lock 1.2 affords 1.992 shares (its fee inside)
+        uint256 n = 1.992e6;
+        uint256 proceeds = n * 0.6e6 / 1e6; // 1,195,200
+        uint256 fee = (proceeds * 500 * 0.4e6 + 1e10 - 1) / 1e10; // 23,904
+        uint256 net = proceeds - fee; // 1,171,296
+        uint256 limitProceeds = n * 0.5e6 / 1e6; // 996,000
+        assertEq(above.balance(bob), 870e6 + 64 * net, "own fills: bob keeps everything");
+        assertEq(above.order(bobId).fills, 64);
+        uint256 bobBefore = above.balance(bob);
+        vm.prank(carol);
+        assertEq(above.matchMarket(mid), 1);
+        assertEq(above.balance(bob), bobBefore + limitProceeds, "seller gets its limit");
+        assertEq(above.balance(carol), net - limitProceeds, "match caller gets the surplus after the fee");
+        // the rest (0.53 shares at 0.5) is under the minimum and went back to bob's position
+        assertFalse(above.order(bobId).resting);
+        (uint256 by,) = above.positions(mid, bob);
+        assertEq(by, 130e6 - 65 * n);
+    }
+
+    /// @dev Finding c5e99df8: closed orders leave the trader's list, so claim's cost does not grow with history.
+    function test_claimWalksOnlyLiveOrders() public {
+        vm.prank(alice);
+        above.split(mid, 5e6);
+        vm.prank(bob);
+        above.split(mid, 5e6);
+        for (uint256 i; i < 300; ++i) {
+            uint64 id = _buy(alice, true, 10_000e6, 100); // lock 1 USDC
+            vm.prank(alice);
+            above.cancel(id);
+        }
+        assertEq(above.ordersOf(mid, alice).length, 0);
+        // swap-and-pop keeps the other live orders listed
+        uint64 a = _buy(alice, true, 10_000e6, 100);
+        uint64 b = _buy(alice, true, 10_000e6, 200);
+        uint64 c = _buy(alice, true, 10_000e6, 300);
+        vm.prank(alice);
+        above.cancel(b);
+        uint64[] memory mine = above.ordersOf(mid, alice);
+        assertEq(mine.length, 2);
+        assertEq(mine[0], a);
+        assertEq(mine[1], c);
+        vm.warp(END + 10);
+        verifier.set(3.01e18, false);
+        oracle.prove(1, END, emptyProofs());
+        vm.prank(bob);
+        uint256 g = gasleft();
+        above.claim(mid);
+        uint256 plain = g - gasleft();
+        vm.prank(alice);
+        g = gasleft();
+        uint256 got = above.claim(mid);
+        uint256 withHistory = g - gasleft();
+        assertEq(got, 5e6);
+        assertEq(above.ordersOf(mid, alice).length, 0, "claim cancelled the two live orders");
+        assertEq(above.balance(alice), 1000e6 - 5e6 + 5e6, "both locks back");
+        // two cancellations on top of a plain claim, nothing for the 300 closed orders
+        assertLt(withHistory, plain + 120_000);
+    }
+
+    /// @dev Finding 1d8da67f: at end + 3 days settle finalizes an unchallenged late proposal instead of voiding.
+    function test_settleFinalizesLateUnchallengedProposal() public {
+        imd.mint(bob, 100 ether);
+        vm.prank(bob);
+        imd.approve(address(oracle), type(uint256).max);
+        vm.prank(alice);
+        above.split(mid, 10e6);
+        vm.warp(END + 3 days - 1 hours - 1);
+        vm.roll(20_000_100);
+        vm.prank(bob);
+        oracle.propose(1, END, 3.5e18, 20_000_000);
+        vm.warp(END + 3 days);
+        above.settle(mid);
+        assertEq(uint8(above.market(mid).outcome), uint8(PimdAbove.Outcome.Yes));
+        assertEq(above.market(mid).close, 3.5e18);
+        assertEq(oracle.price(1, END), 3.5e18);
+        assertEq(oracle.credit(bob), 10 ether, "the proposer's bond is released by the finalization");
+        vm.prank(alice);
+        assertEq(above.claim(mid), 10e6);
+    }
+
+    /// @dev A disputed proposal the oracle never answered still voids the market at end + 3 days.
+    function test_settleVoidsWhenDisputedProposalTimesOut() public {
+        intake.configure(0.5 ether, false);
+        imd.mint(bob, 100 ether);
+        imd.mint(vika, 100 ether);
+        vm.prank(bob);
+        imd.approve(address(oracle), type(uint256).max);
+        vm.prank(vika);
+        imd.approve(address(oracle), type(uint256).max);
+        vm.prank(alice);
+        above.split(mid, 10e6);
+        vm.warp(END + 27 hours + 1);
+        vm.roll(20_000_100);
+        vm.prank(bob);
+        oracle.propose(1, END, 3.5e18, 20_000_000);
+        vm.prank(vika);
+        oracle.dispute(1, END, 1 ether);
+        vm.warp(END + 3 days - 1);
+        vm.expectRevert(PimdAbove.MissingPrice.selector);
+        above.settle(mid);
+        vm.warp(END + 3 days);
+        above.settle(mid);
+        assertEq(uint8(above.market(mid).outcome), uint8(PimdAbove.Outcome.Half));
+        vm.prank(alice);
+        assertEq(above.claim(mid), 10e6);
+    }
+
     function test_ratesOnlyAdminWithinCapsForLaterFills() public {
         vm.prank(OWNER);
         vm.expectRevert(PimdAbove.Unauthorized.selector);

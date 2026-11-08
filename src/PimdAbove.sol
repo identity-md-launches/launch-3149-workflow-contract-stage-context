@@ -16,6 +16,10 @@ import {BoundaryOracle} from "./BoundaryOracle.sol";
 /// lock and receives (amount - fee)/p shares, stopping at N. A sell locks only its N shares and
 /// receives N*p minus the fee. The maker (earlier order) fills at exactly its price; the taker pays
 /// or receives the rest of 1 USDC (mint or burn) or the maker's price (move) within its limit.
+/// The gap of each taker fill (limit cost minus actual cost on a buy, net proceeds over the limit on
+/// a sell) is paid in that fill to the transaction sender: the taker itself in `place`, else the
+/// `matchMarket` caller. A buy's lock that is still unspent when the order closes always returns to
+/// its trader.
 /// Fee = k*(1-q) of the amount, q = the fill price per share clamped to 0.01..0.99, taker k = K,
 /// maker k = Km, credited to the owner; none on cancel, expiry, split, merge or claim.
 contract PimdAbove is ReentrancyGuard {
@@ -65,7 +69,9 @@ contract PimdAbove is ReentrancyGuard {
         uint32 version;
         uint32 period;
         uint64 end;
-        uint256 threshold; // USD per token, 18 decimals, same scale as BoundaryOracle prices
+        // USD at 18 decimals per unitsPerShare of the version's token: the scale BoundaryOracle records
+        // (USD per token only where unitsPerShare is 1e18, as for version 1, U = 1 IMD).
+        uint256 threshold;
         uint256 close;
         uint256 pairs;
         Outcome outcome;
@@ -106,7 +112,9 @@ contract PimdAbove is ReentrancyGuard {
     mapping(address => uint256) public balance;
     mapping(bytes32 => mapping(address => Position)) public positions;
     mapping(uint64 => Order) private orders;
+    // live (resting) orders per trader and market; an order leaves the list when it closes
     mapping(bytes32 => mapping(address => uint64[])) private traderOrders;
+    mapping(uint64 => uint256) private listIndex;
     // heads: market => yes? => buy? => order id
     mapping(bytes32 => mapping(bool => mapping(bool => uint64))) public best;
     uint64 public nextOrderId = 1;
@@ -183,6 +191,9 @@ contract PimdAbove is ReentrancyGuard {
 
     /// @notice Creates "asset above threshold at end" for a registry version and period; end must be a
     /// boundary of that period after now. One market per threshold and end; a ladder is several thresholds.
+    /// `threshold` is on BoundaryOracle's price scale: USD at 18 decimals per unitsPerShare of the version's
+    /// token (per 1 IMD for version 1). For a version with U = 10,000 tokens, "above 0.0001 USD per token"
+    /// is threshold 1e18.
     function createMarket(uint32 version, uint32 period, uint64 end, uint256 threshold)
         external
         nonReentrant
@@ -219,6 +230,7 @@ contract PimdAbove is ReentrancyGuard {
         return marketIds.length;
     }
 
+    /// @notice The trader's resting orders in the market; closed orders are no longer listed.
     function ordersOf(bytes32 id, address trader) external view returns (uint64[] memory) {
         return traderOrders[id][trader];
     }
@@ -310,25 +322,26 @@ contract PimdAbove is ReentrancyGuard {
             }
             o.remaining = input.quantity;
         }
+        listIndex[id] = traderOrders[mid][msg.sender].length;
         traderOrders[mid][msg.sender].push(id);
         emit OrderPlaced(id, mid, msg.sender, input.yes, input.buy, o.remaining, input.price, o.lock, o.expiry);
         _insert(id);
-        _match(mid, id);
-        if (o.resting && (input.market || _underMin(o))) _close(id, input.market ? 4 : 3, msg.sender);
+        _match(mid);
+        if (o.resting && (input.market || _underMin(o))) _close(id, input.market ? 4 : 3);
     }
 
     /// @notice Matches resting crossed orders, by anyone, any time before settlement. The gap between a
-    /// taker's limit and its fill goes to the caller.
+    /// taker's limit and each of its fills goes to the caller; the taker's unspent lock stays its own.
     function matchMarket(bytes32 mid) external nonReentrant returns (uint256 fills) {
         Market storage m = markets[mid];
         if (m.end == 0 || m.outcome != Outcome.Active) revert InvalidMarket();
-        return _match(mid, 0);
+        return _match(mid);
     }
 
     function cancel(uint64 id) external nonReentrant {
         Order storage o = orders[id];
         if (o.trader != msg.sender || !o.resting) revert Unauthorized();
-        _close(id, 5, msg.sender);
+        _close(id, 5);
     }
 
     // ---------------------------------------------------------------- settlement
@@ -337,10 +350,20 @@ contract PimdAbove is ReentrancyGuard {
         _settle(id);
     }
 
+    /// @dev Before voiding a market to Half, an unchallenged proposal whose window has elapsed is finalized
+    /// here, so its close is used: BoundaryOracle.finalize has no upper time bound and always succeeds for
+    /// such a proposal (its deadline is before end + 3 days by construction).
     function _settle(bytes32 id) private {
         Market storage m = markets[id];
         if (m.end == 0 || m.outcome != Outcome.Active || block.timestamp < m.end) revert InvalidMarket();
         uint256 close = oracle.price(m.version, m.end);
+        if (close == 0 && block.timestamp >= uint256(m.end) + VOID_DELAY) {
+            BoundaryOracle.Proposal memory p = oracle.proposal(oracle.proposalId(m.version, m.end));
+            if (p.proposer != address(0) && !p.finished && p.challenger == address(0)) {
+                oracle.finalize(m.version, m.end);
+                close = oracle.price(m.version, m.end);
+            }
+        }
         if (close == 0) {
             if (block.timestamp < uint256(m.end) + VOID_DELAY) revert MissingPrice();
             m.outcome = Outcome.Half;
@@ -358,8 +381,10 @@ contract PimdAbove is ReentrancyGuard {
         Market storage m = markets[id];
         if (m.outcome == Outcome.Active) _settle(id);
         uint64[] storage mine = traderOrders[id][msg.sender];
-        for (uint256 i; i < mine.length; ++i) {
-            if (orders[mine[i]].resting) _close(mine[i], 5, msg.sender);
+        // only resting orders are listed; closing one pops it, so walk from the end
+        for (uint256 i = mine.length; i > 0; --i) {
+            uint64 oid = mine[i - 1];
+            if (orders[oid].resting) _close(oid, 5);
         }
         Position storage p = positions[id][msg.sender];
         uint256 yes = p.yes;
@@ -415,21 +440,27 @@ contract PimdAbove is ReentrancyGuard {
 
     // ---------------------------------------------------------------- matching
 
+    /// @dev A rest is under the minimum when its notional N*p is below 1 USDC; a buy also when its lock
+    /// (which carries the fee) can no longer pay for a single share. An amount-based market buy has no
+    /// share count and is judged by its lock alone.
     function _underMin(Order storage o) private view returns (bool) {
-        if (o.buy) return o.lock < MIN_NOTIONAL || _affordable(o.lock, o.price, _rate(o.price, false)) == 0;
+        if (o.buy) {
+            if (o.lock < MIN_NOTIONAL || _affordable(o.lock, o.price, _rate(o.price, false)) == 0) return true;
+            return o.remaining != type(uint128).max && Math.mulDiv(o.remaining, o.price, SHARE) < MIN_NOTIONAL;
+        }
         return Math.mulDiv(o.remaining, o.price, SHARE) < MIN_NOTIONAL;
     }
 
     /// @dev Four crossings per market: YES buy/sell and NO buy/sell (move), YES buy with NO buy (mint),
     /// YES sell with NO sell (burn). The earliest order of a crossing pair is the maker.
-    function _match(bytes32 mid, uint64 incoming) private returns (uint256 fills) {
+    function _match(bytes32 mid) private returns (uint256 fills) {
         for (uint256 steps; steps < MAX_STEPS; ++steps) {
             if (_expireHeads(mid)) continue;
             (uint64 a, uint64 b) = _cross(mid);
             if (a == 0) break;
             uint64 makerId = a < b ? a : b;
             uint64 takerId = a < b ? b : a;
-            if (!_fill(mid, makerId, takerId, incoming)) break;
+            if (!_fill(mid, makerId, takerId)) break;
             ++fills;
         }
     }
@@ -439,7 +470,7 @@ contract PimdAbove is ReentrancyGuard {
             [best[mid][true][true], best[mid][true][false], best[mid][false][true], best[mid][false][false]];
         for (uint256 i; i < 4; ++i) {
             if (heads[i] != 0 && orders[heads[i]].expiry <= block.timestamp) {
-                _close(heads[i], 1, orders[heads[i]].trader);
+                _close(heads[i], 1);
                 any = true;
             }
         }
@@ -470,7 +501,11 @@ contract PimdAbove is ReentrancyGuard {
     }
 
     /// @dev Returns false when nothing could fill (a side exhausted); the caller then stops.
-    function _fill(bytes32 mid, uint64 makerId, uint64 takerId, uint64 incoming) private returns (bool) {
+    /// The taker's gap on this fill alone goes to msg.sender: on a buy, the limit cost n*p of the shares
+    /// bought minus what they cost, taken out of the lock, so the lock keeps covering the remaining
+    /// shares; on a sell, the net proceeds over n*p. An amount-based market buy has no share limit and
+    /// no per-fill gap: its unspent amount returns to its trader in its own transaction.
+    function _fill(bytes32 mid, uint64 makerId, uint64 takerId) private returns (bool) {
         Order storage mk = orders[makerId];
         Order storage tk = orders[takerId];
         Market storage m = markets[mid];
@@ -487,8 +522,8 @@ contract PimdAbove is ReentrancyGuard {
         if (tk.buy) v.n = Math.min(v.n, _affordable(tk.lock, v.takerPrice, v.takerRate));
         if (v.n == 0) {
             // the exhausted buyer rests no more: close it and let matching continue
-            if (mk.buy && _affordable(mk.lock, v.makerPrice, v.makerRate) == 0) _close(makerId, 3, mk.trader);
-            else if (tk.buy) _close(takerId, 3, takerId == incoming ? msg.sender : tk.trader);
+            if (mk.buy && _affordable(mk.lock, v.makerPrice, v.makerRate) == 0) _close(makerId, 3);
+            else if (tk.buy) _close(takerId, 3);
             else return false;
             return true;
         }
@@ -502,6 +537,7 @@ contract PimdAbove is ReentrancyGuard {
             balance[mk.trader] += v.makerAmount - v.makerFee;
         }
         // taker
+        uint256 limitAmount = Math.mulDiv(v.n, tk.price, SHARE);
         if (tk.buy) {
             if (mint) {
                 // the rest of 1 USDC per pair after the maker's share, fee inside
@@ -509,17 +545,30 @@ contract PimdAbove is ReentrancyGuard {
                 v.takerFee = Math.mulDiv(base, v.takerRate, R - v.takerRate, Math.Rounding.Ceil);
                 v.takerAmount = base + v.takerFee;
                 if (v.takerAmount > tk.lock) {
-                    // rounding pushed over the lock: shrink by one share and recompute next step
-                    return _shrinkOrClose(mid, makerId, takerId, incoming, v);
+                    // rounding pushed over the lock: the taker can afford no whole share here
+                    _close(takerId, 3);
+                    return true;
                 }
             } else {
                 (v.takerAmount, v.takerFee) = _buyCost(v.n, v.takerPrice, v.takerRate);
             }
             tk.lock -= v.takerAmount;
+            if (tk.remaining != type(uint128).max && limitAmount > v.takerAmount) {
+                uint256 gap = Math.min(limitAmount - v.takerAmount, tk.lock);
+                tk.lock -= gap;
+                balance[msg.sender] += gap;
+                emit GapReturned(takerId, msg.sender, gap);
+            }
         } else {
             v.takerAmount = burn ? v.n - v.makerAmount : Math.mulDiv(v.n, v.takerPrice, SHARE);
             v.takerFee = Math.mulDiv(v.takerAmount, v.takerRate, R, Math.Rounding.Ceil);
-            balance[tk.trader] += v.takerAmount - v.takerFee;
+            uint256 net = v.takerAmount - v.takerFee;
+            uint256 toTrader = Math.min(net, limitAmount);
+            balance[tk.trader] += toTrader;
+            if (net > toTrader) {
+                balance[msg.sender] += net - toTrader;
+                emit GapReturned(takerId, msg.sender, net - toTrader);
+            }
         }
         // shares and pairs
         if (mint) m.pairs += v.n;
@@ -532,13 +581,8 @@ contract PimdAbove is ReentrancyGuard {
         ++tk.fills;
         balance[owner] += v.makerFee + v.takerFee;
         emit Fill(mid, makerId, takerId, v.n, v.makerAmount, v.takerAmount, v.makerFee, v.takerFee);
-        _afterFill(makerId, mk.trader);
-        _afterFill(takerId, takerId == incoming ? msg.sender : msg.sender);
-        return true;
-    }
-
-    function _shrinkOrClose(bytes32, uint64, uint64 takerId, uint64 incoming, FillVars memory) private returns (bool) {
-        _close(takerId, 3, takerId == incoming ? msg.sender : orders[takerId].trader);
+        _afterFill(makerId);
+        _afterFill(takerId);
         return true;
     }
 
@@ -549,13 +593,13 @@ contract PimdAbove is ReentrancyGuard {
     }
 
     /// @dev Closes a filled order, a sub-minimum rest (lock refunded) or one at its fill cap.
-    function _afterFill(uint64 id, address gapTo) private {
+    function _afterFill(uint64 id) private {
         Order storage o = orders[id];
         if (!o.resting) return;
         if (o.remaining == 0 || o.fills >= MAX_ORDER_FILLS) {
-            _close(id, 0, gapTo);
+            _close(id, 0);
         } else if (_underMin(o)) {
-            _close(id, 3, gapTo);
+            _close(id, 3);
         }
     }
 
@@ -585,24 +629,27 @@ contract PimdAbove is ReentrancyGuard {
     }
 
     /// @dev reason: 0 filled, 1 expired, 3 rest under the minimum, 4 market order rest, 5 cancelled.
-    /// A buy's unused lock goes to `refundTo`: the trader on cancel, expiry and a plain close, the
-    /// transaction sender (taker or match caller) for the gap of a taker's fill.
-    function _close(uint64 id, uint8 reason, address refundTo) private {
+    /// A buy's unspent lock always returns to its trader: the gap of every fill was already paid to
+    /// that fill's transaction sender in `_fill`. Removes the order from the book and its trader's list.
+    function _close(uint64 id, uint8 reason) private {
         Order storage o = orders[id];
         if (o.resting) {
             if (o.previous != 0) orders[o.previous].next = o.next;
             else best[o.market][o.yes][o.buy] = o.next;
             if (o.next != 0) orders[o.next].previous = o.previous;
+            uint64[] storage mine = traderOrders[o.market][o.trader];
+            uint256 i = listIndex[id];
+            uint64 last = mine[mine.length - 1];
+            mine[i] = last;
+            listIndex[last] = i;
+            mine.pop();
+            delete listIndex[id];
         }
         uint256 refund;
         if (o.buy) {
             refund = o.lock;
             o.lock = 0;
-            address to = (reason == 1 || reason == 5 || o.fills == 0) ? o.trader : refundTo;
-            if (refund != 0) {
-                balance[to] += refund;
-                if (to != o.trader) emit GapReturned(id, to, refund);
-            }
+            if (refund != 0) balance[o.trader] += refund;
         } else if (o.remaining != 0) {
             if (o.yes) positions[o.market][o.trader].yes += o.remaining;
             else positions[o.market][o.trader].no += o.remaining;
