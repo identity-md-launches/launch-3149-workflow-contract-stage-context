@@ -29,6 +29,7 @@ All in one launch transaction under 16 777 216 gas; no linked libraries, delegat
 6. PimdMarkets2($owner, fee admin 0x8Ad18E99F4C8d8406f9Ba8899CF308000518A981, $contract:PimdRegistry, $contract:BoundaryOracle, $contract:PimdSwap2, $contract:StartOracle): markets, books, balances, fees. (fail, don't change)
 - Runtime over 24 576 bytes: split PimdAbove into at most 2 contracts via $contract: args. (fail, don't change)
 - Runtime over 24 576 bytes: split PimdMarkets2 into at most 3 contracts via $contract: args. (fail, don't change)
+- Splits add at most 2 contracts in total, so the launch has at most 8 contracts beside the token; if more are needed, fail. (fail, don't change)
 - $owner = the paying wallet: only gets all PimdAbove fees. No access to user funds, no setter.
 - $owner = the paying wallet: gets all market fees, its token share and token pool fees only; no setter or access to user funds.
 - Asset admin: only adds asset versions and periods in PimdRegistry and hands its role; no other power, no access to funds, no change of an existing version.
