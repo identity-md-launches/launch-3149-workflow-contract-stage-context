@@ -1,0 +1,53 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "(p)IMD",
+    "symbol": "pIMD",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "PimdRegistry",
+      "constructorArgs": [
+        "0x8ad18e99f4c8d8406f9ba8899cf308000518a981"
+      ]
+    },
+    {
+      "contract": "BoundaryOracle",
+      "constructorArgs": [
+        "$contract:PimdRegistry",
+        "0xa19a97b522cb379c2fb846a4b18589775f674ee9"
+      ]
+    },
+    {
+      "contract": "PimdAbove",
+      "constructorArgs": [
+        "$contract:PimdRegistry",
+        "$contract:BoundaryOracle",
+        "0x8ad18e99f4c8d8406f9ba8899cf308000518a981",
+        "$owner"
+      ]
+    },
+    {
+      "contract": "StartOracle",
+      "constructorArgs": [
+        "$contract:PimdRegistry",
+        "$contract:BoundaryOracle"
+      ]
+    },
+    {
+      "contract": "PimdSwap2",
+      "constructorArgs": [
+        "$contract:PimdRegistry"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "(p)IMD on-chain prediction market, Ethereum mainnet, built from SPEC.md. LaunchToken (src/LaunchToken.sol) is the fixed-supply pIMD ERC-20 with no constructor arguments; the factory mints and splits its supply. Five application contracts in SPEC.md section 2 deploy order, every argument address-typed and every constructor nonpayable with no external calls. PimdRegistry(assetAdmin): the asset admin is the admin wallet SPEC.md names, 0x8ad18e99f4c8d8406f9ba8899cf308000518a981; it adds asset versions and periods and may hand its role on; version 1 (IMD) and periods 0-3 are set in the constructor. BoundaryOracle(registry, verifier): the registry just deployed and the fixed mainnet BoundaryProofVerifier 0xa19a97b522cb379c2fb846a4b18589775f674ee9 (stored, not called, at construction). PimdAbove(registry, oracle, admin, owner): the admin wallet creates markets and sets rates within SPEC.md caps; $owner, the launch's owner, is credited every market fee and has no other power. StartOracle(registry, oracle): start prices requested 27 h or later via the IMD oracle INTAKE. PimdSwap2(registry): exact-output swaps along a version's path. PimdMarkets2 (SPEC.md section 6) is not in the accepted tree at this commit (see ADAPTATION.md and README Known limitations), so it is not listed here; a later build that adds it must extend this manifest. No contract receives any of the token supply at launch. Pool: pIMD paired with IMD at the launch policy's values; the deployer derives the opening price from the 2,500 IMD opening market cap."
+}
