@@ -1,4 +1,4 @@
-# (p)IMD $pIMD v2 specification
+# (p)IMD $pIMD - on-chain prediction market
 
 Binding specification of one Ethereum mainnet company launch: contracts, the (p)IMD token and the website. Build exactly what is written here.
 
