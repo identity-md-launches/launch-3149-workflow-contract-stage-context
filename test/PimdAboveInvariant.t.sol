@@ -133,15 +133,44 @@ contract AboveHandler is Test {
         if (mine.length == 0) return;
         uint64 id = mine[idSeed % mine.length];
         if (!above.order(id).resting) return;
+        PimdAbove.Order memory o = above.order(id);
+        uint256 balBefore = above.balance(a);
+        uint256 matcherBefore = above.balance(actors[3]);
+        (uint256 yBefore, uint256 nBefore) = above.positions(mid, a);
         vm.prank(a);
         above.cancel(id);
+        // the whole unspent lock (buy) or the escrowed shares (sell) go back to the trader, no one else
+        (uint256 yAfter, uint256 nAfter) = above.positions(mid, a);
+        if (o.buy) {
+            require(above.balance(a) == balBefore + o.lock, "cancel refund != lock");
+        } else {
+            require(above.balance(a) == balBefore, "cancel of a sell moved USDC");
+            require(yAfter == yBefore + (o.yes ? o.remaining : 0), "YES not returned");
+            require(nAfter == nBefore + (o.yes ? 0 : o.remaining), "NO not returned");
+        }
+        require(above.balance(actors[3]) == matcherBefore, "cancel paid the matcher");
         ++calls;
     }
 
     function matchByThirdParty() external {
         if (settled) return;
+        uint256[4] memory bal;
+        uint256[3] memory ys;
+        uint256[3] memory ns;
+        for (uint256 i; i < 4; ++i) {
+            bal[i] = above.balance(actors[i]);
+            if (i < 3) (ys[i], ns[i]) = above.positions(mid, actors[i]);
+        }
         vm.prank(actors[3]);
         above.matchMarket(mid);
+        // matching only credits: fills, gaps and refunds never take a free balance or a position away
+        for (uint256 i; i < 4; ++i) {
+            require(above.balance(actors[i]) >= bal[i], "match debited a free balance");
+            if (i < 3) {
+                (uint256 y, uint256 n) = above.positions(mid, actors[i]);
+                require(y >= ys[i] && n >= ns[i], "match took a position");
+            }
+        }
         ++calls;
     }
 
@@ -267,6 +296,44 @@ contract PimdAboveInvariantTest is BaseTest {
     /// forge-config: default.invariant.depth = 40
     function invariant_ownerFeesNeverDecrease() public {
         handler.recordOwner();
+    }
+
+    /// @notice ordersOf lists exactly the trader's resting orders in the market, each once.
+    /// forge-config: default.invariant.runs = 128
+    /// forge-config: default.invariant.depth = 40
+    function invariant_liveListsMatchBook() public view {
+        uint64 last = above.nextOrderId();
+        for (uint256 i; i < 3; ++i) {
+            address a = handler.actors(i);
+            uint64[] memory mine = above.ordersOf(mid, a);
+            uint256 resting;
+            for (uint64 id = 1; id < last; ++id) {
+                PimdAbove.Order memory o = above.order(id);
+                if (o.resting && o.trader == a) ++resting;
+            }
+            assertEq(mine.length, resting, "list length != resting orders");
+            for (uint256 j; j < mine.length; ++j) {
+                PimdAbove.Order memory o = above.order(mine[j]);
+                assertTrue(o.resting, "closed order listed");
+                assertEq(o.trader, a, "foreign order listed");
+                for (uint256 k = j + 1; k < mine.length; ++k) {
+                    assertTrue(mine[j] != mine[k], "order listed twice");
+                }
+            }
+        }
+    }
+
+    /// @notice A resting buy's lock never exceeds its limit cost for its remaining shares (plus one
+    /// unit of rounding per fill): gaps leave the lock as fills happen, they are not hoarded in it.
+    /// forge-config: default.invariant.runs = 128
+    /// forge-config: default.invariant.depth = 40
+    function invariant_restingBuyLockWithinLimit() public view {
+        uint64 last = above.nextOrderId();
+        for (uint64 id = 1; id < last; ++id) {
+            PimdAbove.Order memory o = above.order(id);
+            if (!o.resting || !o.buy || o.remaining == type(uint128).max) continue;
+            assertLe(o.lock, uint256(o.remaining) * o.price / 1e6 + o.fills, "lock over N*p");
+        }
     }
 
     /// @notice A settled market stays settled.
